@@ -16,8 +16,17 @@
 
 package com.allogy.build.maven;
 
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.AWSCredentialsProviderChain;
+import com.amazonaws.auth.AWSSessionCredentials;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.s3.model.CannedAccessControlList;
+import com.google.common.base.Optional;
+import org.apache.maven.wagon.authentication.AuthenticationInfo;
 import org.apache.maven.wagon.repository.Repository;
+import org.kuali.maven.wagon.auth.AuthenticationInfoCredentialsProvider;
+import org.kuali.maven.wagon.auth.AwsCredentials;
+import org.kuali.maven.wagon.auth.AwsSessionCredentials;
 
 public class S3Wagon extends org.kuali.maven.wagon.S3Wagon
 {
@@ -25,5 +34,27 @@ public class S3Wagon extends org.kuali.maven.wagon.S3Wagon
     protected CannedAccessControlList getAclFromRepository(Repository repository)
     {
         return CannedAccessControlList.Private;
+    }
+
+    @Override
+    protected AWSCredentials getCredentials(final AuthenticationInfo authenticationInfo)
+    {
+        Optional<AuthenticationInfo> auth = Optional.fromNullable(authenticationInfo);
+        AuthenticationInfoCredentialsProvider authenticationInfoCredentialsProvider = new AuthenticationInfoCredentialsProvider(auth);
+
+        DefaultAWSCredentialsProviderChain defaultChain = new DefaultAWSCredentialsProviderChain();
+
+        AWSCredentialsProviderChain aggregateChain =
+                new AWSCredentialsProviderChain(authenticationInfoCredentialsProvider, defaultChain);
+
+        AWSCredentials credentials = aggregateChain.getCredentials();
+        if (credentials instanceof AWSSessionCredentials)
+        {
+            return new AwsSessionCredentials((AWSSessionCredentials) credentials);
+        }
+        else
+        {
+            return new AwsCredentials(credentials);
+        }
     }
 }
