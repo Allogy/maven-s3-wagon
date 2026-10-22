@@ -19,6 +19,8 @@ package com.allogy.build.maven;
 import org.apache.maven.wagon.ResourceDoesNotExistException;
 import org.apache.maven.wagon.TransferFailedException;
 import org.apache.maven.wagon.authorization.AuthorizationException;
+import org.apache.maven.wagon.events.TransferEvent;
+import org.apache.maven.wagon.events.TransferListener;
 import org.apache.maven.wagon.repository.Repository;
 import org.junit.Before;
 import org.junit.Rule;
@@ -49,6 +51,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import static org.hamcrest.CoreMatchers.hasItem;
@@ -147,6 +150,38 @@ public class S3WagonTest
         assertThat(wagon.toS3Key("com/foo/bar.jar"), is("com/foo/bar.jar"));
     }
 
+    @Test(expected = IllegalArgumentException.class)
+    public void toS3Key_rejects_parent_traversal_escaping_prefix() throws Exception
+    {
+        TestableS3Wagon wagon = connect(URL);
+        wagon.toS3Key("../../other/secret.jar");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void toS3Key_rejects_embedded_parent_traversal() throws Exception
+    {
+        TestableS3Wagon wagon = connect(URL);
+        wagon.toS3Key("com/foo/../../../../secret.jar");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void toS3Key_rejects_backslash_parent_traversal() throws Exception
+    {
+        // Backslashes are normalized to '/' first, so a Windows-style traversal
+        // must be caught just the same.
+        TestableS3Wagon wagon = connect(URL);
+        wagon.toS3Key("..\\..\\secret.jar");
+    }
+
+    @Test
+    public void toS3Key_allows_double_dot_inside_a_filename() throws Exception
+    {
+        // ".." must only be rejected as a whole path segment; a filename that
+        // merely contains ".." is a legitimate key and must pass through.
+        TestableS3Wagon wagon = connect(URL);
+        assertThat(wagon.toS3Key("com/foo/bar..baz-1.0.jar"), is("base/path/com/foo/bar..baz-1.0.jar"));
+    }
+
     // --- put -----------------------------------------------------------------
 
     @Test
@@ -181,6 +216,60 @@ public class S3WagonTest
                 .thenThrow(s3Exception(403, "AccessDenied"));
 
         wagon.put(source, "com/foo/artifact-1.0.jar");
+    }
+
+    @Test
+    public void put_fires_transfer_progress_for_uploaded_bytes() throws Exception
+    {
+        TestableS3Wagon wagon = connect(URL);
+        byte[] payload = "the-uploaded-artifact-bytes".getBytes(StandardCharsets.UTF_8);
+        File source = tmp.newFile("artifact.jar");
+        Files.write(source.toPath(), payload);
+
+        // The real S3 client drains the request body; the mock must do the same
+        // so the progress-firing stream is actually read.
+        when(s3.putObject(any(Consumer.class), any(RequestBody.class))).thenAnswer(invocation -> {
+            RequestBody body = invocation.getArgument(1);
+            try (InputStream in = body.contentStreamProvider().newStream())
+            {
+                byte[] buffer = new byte[8];
+                while (in.read(buffer) != -1)
+                {
+                    // discard; reading is what drives fireTransferProgress
+                }
+            }
+            return null;
+        });
+
+        AtomicLong progressBytes = new AtomicLong();
+        wagon.addTransferListener(new ProgressRecordingListener(progressBytes));
+
+        wagon.put(source, "com/foo/artifact-1.0.jar");
+
+        assertThat(progressBytes.get(), is((long) payload.length));
+    }
+
+    /** Sums the byte counts reported to {@code transferProgress}. */
+    private static final class ProgressRecordingListener implements TransferListener
+    {
+        private final AtomicLong total;
+
+        ProgressRecordingListener(AtomicLong total)
+        {
+            this.total = total;
+        }
+
+        @Override
+        public void transferProgress(TransferEvent transferEvent, byte[] buffer, int length)
+        {
+            total.addAndGet(length);
+        }
+
+        @Override public void transferInitiated(TransferEvent transferEvent) { }
+        @Override public void transferStarted(TransferEvent transferEvent) { }
+        @Override public void transferCompleted(TransferEvent transferEvent) { }
+        @Override public void transferError(TransferEvent transferEvent) { }
+        @Override public void debug(String message) { }
     }
 
     // --- resourceExists ------------------------------------------------------
@@ -268,13 +357,72 @@ public class S3WagonTest
     }
 
     @Test(expected = ResourceDoesNotExistException.class)
-    public void getFileList_empty_throws_ResourceDoesNotExist() throws Exception
+    public void getFileList_missing_directory_throws_ResourceDoesNotExist() throws Exception
     {
+        // No children and no directory marker: the prefix does not exist.
         TestableS3Wagon wagon = connect(URL);
         when(s3.listObjectsV2(any(ListObjectsV2Request.class)))
                 .thenReturn(ListObjectsV2Response.builder().isTruncated(false).build());
 
         wagon.getFileList("com");
+    }
+
+    @Test
+    public void getFileList_existing_but_empty_directory_returns_empty_list() throws Exception
+    {
+        // A directory marker (zero-length object keyed exactly at the prefix,
+        // with its trailing slash) proves the directory exists even with no
+        // children. The Wagon contract says return an empty list here, NOT throw.
+        TestableS3Wagon wagon = connect(URL);
+        ListObjectsV2Response response = ListObjectsV2Response.builder()
+                .contents(S3Object.builder().key("base/path/com/").build())
+                .isTruncated(false)
+                .build();
+        when(s3.listObjectsV2(any(ListObjectsV2Request.class))).thenReturn(response);
+
+        List<String> files = wagon.getFileList("com");
+
+        assertThat(files.isEmpty(), is(true));
+    }
+
+    @Test
+    public void getFileList_directory_marker_is_not_listed_as_a_child() throws Exception
+    {
+        // The marker proves existence but must not appear as a file entry, while
+        // genuine children alongside it are still returned.
+        TestableS3Wagon wagon = connect(URL);
+        ListObjectsV2Response response = ListObjectsV2Response.builder()
+                .contents(
+                        S3Object.builder().key("base/path/com/").build(),
+                        S3Object.builder().key("base/path/com/child.jar").build())
+                .isTruncated(false)
+                .build();
+        when(s3.listObjectsV2(any(ListObjectsV2Request.class))).thenReturn(response);
+
+        List<String> files = wagon.getFileList("com");
+
+        assertThat(files, hasItem("child.jar"));
+        assertThat(files, not(hasItem("")));
+    }
+
+    @Test
+    public void getFileList_appends_trailing_slash_to_prefix() throws Exception
+    {
+        // The requested directory is listed without a trailing slash; the wagon
+        // must query S3 with the slash-terminated prefix so the delimiter groups
+        // the right level. Capture the request and assert the prefix.
+        TestableS3Wagon wagon = connect(URL);
+        ListObjectsV2Response response = ListObjectsV2Response.builder()
+                .contents(S3Object.builder().key("base/path/com/a.jar").build())
+                .isTruncated(false)
+                .build();
+        when(s3.listObjectsV2(any(ListObjectsV2Request.class))).thenReturn(response);
+
+        wagon.getFileList("com");
+
+        ArgumentCaptor<ListObjectsV2Request> captor = ArgumentCaptor.forClass(ListObjectsV2Request.class);
+        verify(s3).listObjectsV2(captor.capture());
+        assertThat(captor.getValue().prefix(), is("base/path/com/"));
     }
 
     // --- get -----------------------------------------------------------------

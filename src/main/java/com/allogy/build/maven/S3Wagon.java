@@ -28,8 +28,10 @@ import org.apache.maven.wagon.resource.Resource;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.core.internal.util.Mimetype;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.core.sync.ResponseTransformer;
+import software.amazon.awssdk.http.ContentStreamProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CommonPrefix;
@@ -43,8 +45,11 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.io.BufferedOutputStream;
 import java.io.File;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -123,11 +128,12 @@ public class S3Wagon extends AbstractWagon
 
         createParentDirectories(destination);
         fireGetStarted(resource, destination);
-        try
+        // body is opened before the staging OutputStream, so it must be a
+        // try-with-resources resource: if Files.newOutputStream(stage) throws,
+        // getTransfer never runs to close it and the S3 connection would leak.
+        try (ResponseInputStream<GetObjectResponse> body =
+                     s3.getObject(b -> b.bucket(bucket()).key(key), ResponseTransformer.toInputStream()))
         {
-            ResponseInputStream<GetObjectResponse> body =
-                    s3.getObject(b -> b.bucket(bucket()).key(key), ResponseTransformer.toInputStream());
-
             GetObjectResponse response = body.response();
             if (response.contentLength() != null)
             {
@@ -217,7 +223,7 @@ public class S3Wagon extends AbstractWagon
             // No .acl(...): objects inherit bucket defaults, which is correct for
             // both ACL-disabled "Bucket owner enforced" and Block-Public-Access
             // buckets. The legacy forced-Private canned ACL is intentionally dropped.
-            s3.putObject(b -> b.bucket(bucket()).key(key), RequestBody.fromFile(source));
+            s3.putObject(b -> b.bucket(bucket()).key(key), progressBody(resource, source));
         }
         catch (SdkException e)
         {
@@ -266,6 +272,12 @@ public class S3Wagon extends AbstractWagon
         }
 
         List<String> files = new ArrayList<>();
+        // A zero-length object whose key equals the prefix is S3's "directory
+        // marker": proof the directory exists even when it has no children.
+        // Tracking it separately lets us honor the Wagon contract, which draws a
+        // distinction S3 does not: an empty-but-present directory returns an
+        // empty list, while a genuinely absent one throws ResourceDoesNotExist.
+        boolean directoryExists = false;
         String continuationToken = null;
         try
         {
@@ -288,12 +300,18 @@ public class S3Wagon extends AbstractWagon
                 {
                     files.add(relativize(commonPrefix.prefix(), listPrefix));
                 }
-                // Contents are files, relative to the requested directory. Skip a
-                // key equal to the prefix itself (a zero-length "directory marker").
+                // Contents are files, relative to the requested directory. A key
+                // equal to the prefix relativizes to the empty string: that is
+                // the directory marker, which proves existence but is not itself
+                // a listed child.
                 for (S3Object object : response.contents())
                 {
                     String relative = relativize(object.key(), listPrefix);
-                    if (!relative.isEmpty())
+                    if (relative.isEmpty())
+                    {
+                        directoryExists = true;
+                    }
+                    else
                     {
                         files.add(relative);
                     }
@@ -314,7 +332,9 @@ public class S3Wagon extends AbstractWagon
             throw new TransferFailedException("Failed to list " + prefix, e);
         }
 
-        if (files.isEmpty())
+        // Only a prefix with no children and no directory marker is treated as
+        // absent. An existing-but-empty directory returns the empty list.
+        if (files.isEmpty() && !directoryExists)
         {
             throw new ResourceDoesNotExistException("No files found under " + prefix);
         }
@@ -335,9 +355,101 @@ public class S3Wagon extends AbstractWagon
     }
 
     /**
+     * Builds an upload body that fires {@code fireTransferProgress} for every
+     * chunk the SDK reads off disk, so {@link org.apache.maven.wagon.events.TransferListener}s
+     * see the same per-byte PUT progress the legacy wagon emitted.
+     *
+     * <p>The body is backed by a {@link ContentStreamProvider} rather than a
+     * one-shot {@code InputStream}: {@code newStream()} reopens the file on each
+     * call, so the SDK can still retry a failed upload (a plain
+     * {@code RequestBody.fromInputStream} would not be resettable). The
+     * Content-Type is resolved from the file extension exactly as
+     * {@code RequestBody.fromFile} would, preserving the header.</p>
+     */
+    private RequestBody progressBody(Resource resource, File source)
+    {
+        long length = source.length();
+        String contentType = Mimetype.getInstance().getMimetype(source.toPath());
+        ContentStreamProvider provider = () -> new ProgressInputStream(openFile(source), resource);
+        return RequestBody.fromContentProvider(provider, length, contentType);
+    }
+
+    private static InputStream openFile(File source)
+    {
+        try
+        {
+            return Files.newInputStream(source.toPath());
+        }
+        catch (IOException e)
+        {
+            // Surfaced to the SDK, which wraps it; put() maps the resulting
+            // SdkException through translatePut like any other upload failure.
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Wraps the upload stream and fires a TRANSFER_PROGRESS event for each chunk
+     * read, mirroring AbstractWagon's download-side progress reporting on the
+     * upload path.
+     */
+    private final class ProgressInputStream extends FilterInputStream
+    {
+        private final Resource resource;
+
+        ProgressInputStream(InputStream in, Resource resource)
+        {
+            super(in);
+            this.resource = resource;
+        }
+
+        @Override
+        public int read() throws IOException
+        {
+            int b = super.read();
+            if (b != -1)
+            {
+                fireProgress(new byte[] { (byte) b }, 1);
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException
+        {
+            int count = super.read(b, off, len);
+            if (count > 0)
+            {
+                // fireTransferProgress reads from offset 0, so hand it a buffer
+                // whose first `count` bytes are exactly what was just read.
+                byte[] chunk = off == 0 ? b : java.util.Arrays.copyOfRange(b, off, off + count);
+                fireProgress(chunk, count);
+            }
+            return count;
+        }
+
+        private void fireProgress(byte[] buffer, int length)
+        {
+            TransferEvent event = new TransferEvent(
+                    S3Wagon.this, resource, TransferEvent.TRANSFER_PROGRESS, TransferEvent.REQUEST_PUT);
+            fireTransferProgress(event, buffer, length);
+        }
+    }
+
+    /**
      * Maps a wagon resource name to an S3 object key by prepending the
      * repository base directory, normalizing separators, collapsing repeated
      * slashes, and stripping any leading slash.
+     *
+     * <p>A {@code ..} path segment is rejected rather than resolved: because the
+     * base directory is always prepended, a parent-directory segment can only be
+     * an attempt to reference a key outside the configured repository prefix.
+     * Forbidding {@code ..} outright keeps every produced key within the prefix
+     * without any path-resolution machinery. A {@code ..} appearing inside a
+     * segment (e.g. {@code bar..baz.jar}) is a legitimate name and is allowed.</p>
+     *
+     * @throws IllegalArgumentException if the resource path contains a {@code ..}
+     *         segment that would escape the repository prefix
      */
     String toS3Key(String resourceName)
     {
@@ -348,6 +460,14 @@ public class S3Wagon extends AbstractWagon
         if (combined.startsWith("/"))
         {
             combined = combined.substring(1);
+        }
+        for (String segment : combined.split("/"))
+        {
+            if (segment.equals(".."))
+            {
+                throw new IllegalArgumentException(
+                        "Resource path escapes the repository prefix: " + resourceName);
+            }
         }
         return combined;
     }
